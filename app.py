@@ -89,33 +89,54 @@ PERFORMANCE_DATA = {
     }
 }
 
+ALL_ARCHS = ["BiLSTM", "GRU", "CNN1D"]
+
 # --- Global Sidebar Navigation ---
 with st.sidebar:
     st.header("Diagnostic Configuration")
     target_hw = st.selectbox("Target Hardware Vendor", list(HW_CONFIG.keys()))
-    target_arch = st.selectbox("Neural Network Architecture", ["BiLSTM", "GRU", "CNN1D"])
+    target_arch = st.selectbox("Primary Architecture (XAI & Detailed Metrics)", ALL_ARCHS)
+    agg_strategy = st.selectbox(
+        "Consensus Aggregation Strategy",
+        ["Recall-Weighted Soft Voting", "Unweighted Mean Probability", "Majority Hard Voting (2/3)"]
+    )
     
     hw_id = HW_CONFIG[target_hw]['id']
     feature_names = HW_CONFIG[target_hw]['features']
     raw_col_names = HW_CONFIG[target_hw]['raw_cols']
-    weight_file = f"{target_arch.lower()}_{hw_id}_best.pth"
-    if target_hw == 'Seagate ST4000DM000' and target_arch == 'BiLSTM':
-        weight_file = 'bilstm_hdd_best.pth'
+
+def get_weight_filename(hw_name, hw_identifier, arch):
+    if hw_name == 'Seagate ST4000DM000' and arch == 'BiLSTM':
+        return 'bilstm_hdd_best.pth'
+    return f"{arch.lower()}_{hw_identifier}_best.pth"
 
 @st.cache_resource
-def load_model(arch, weights_path):
-    if arch == "BiLSTM": model = HDDBiLSTM()
-    elif arch == "GRU": model = HDDGRU()
-    elif arch == "CNN1D": model = HDDCNN1D()
+def load_single_model(arch, weights_path):
+    if arch == "BiLSTM": m = HDDBiLSTM()
+    elif arch == "GRU": m = HDDGRU()
+    elif arch == "CNN1D": m = HDDCNN1D()
     
+    loaded_ok = False
     try:
-        model.load_state_dict(torch.load(weights_path, map_location=torch.device('cpu'), weights_only=True))
-        st.sidebar.success(f"Loaded: {weights_path}")
+        m.load_state_dict(torch.load(weights_path, map_location=torch.device('cpu'), weights_only=True))
+        loaded_ok = True
     except FileNotFoundError:
-        st.sidebar.error(f"Missing weights: {weights_path}")
+        loaded_ok = False
         
-    model.eval()
-    return model
+    m.eval()
+    return m, loaded_ok
+
+models_dict = {}
+with st.sidebar:
+    st.markdown("##### Loaded Model Weights")
+    for arch_name in ALL_ARCHS:
+        w_file = get_weight_filename(target_hw, hw_id, arch_name)
+        mdl, status = load_single_model(arch_name, w_file)
+        models_dict[arch_name] = mdl
+        if status:
+            st.success(f"{arch_name}: `{w_file}`")
+        else:
+            st.error(f"{arch_name} Missing: `{w_file}`")
 
 def generate_sample_csv(cols, is_failing=False):
     np.random.seed(42 if not is_failing else 99)
@@ -126,14 +147,12 @@ def generate_sample_csv(cols, is_failing=False):
     df.insert(0, 'day', [f"Day {i+1}" for i in range(15)])
     return df.to_csv(index=False).encode('utf-8')
 
-model = load_model(target_arch, weight_file)
-
 # --- UI Layout ---
-tab1, tab2, tab3 = st.tabs(["Live Diagnostics", "Dataset Analytics", "Model Performance"])
+tab1, tab2, tab3 = st.tabs(["Live Diagnostics (Multi-Model)", "Dataset Analytics", "Model Performance"])
 
 # TAB 1: Diagnostics
 with tab1:
-    st.subheader(f"Target Telemetry: {target_hw} via {target_arch}")
+    st.subheader(f"Multi-Model Telemetry Evaluation: {target_hw}")
     
     input_mode = st.radio(
         "Select Telemetry Input Source:",
@@ -216,31 +235,113 @@ with tab1:
             sample_tensor = torch.randn(1, 15, 6) 
             sample_tensor[:, 10:, :] += 3.5 
 
-    if st.button("Execute OS Diagnostics", type="primary", disabled=(sample_tensor is None)):
-        with st.spinner("Analyzing temporal degradation sequences..."):
-            t_start = time.perf_counter()
+    if st.button("Execute Multi-Model OS Diagnostics", type="primary", disabled=(sample_tensor is None)):
+        with st.spinner("Executing parallel inference across Bi-LSTM, Bi-GRU, and 1D-CNN..."):
+            indiv_probs = {}
+            indiv_latencies = {}
+            recall_weights = {}
+            
             with torch.no_grad():
-                output = model(sample_tensor)
-                probability = torch.sigmoid(output).item()
-            inference_ms = (time.perf_counter() - t_start) * 1000.0
+                for arch_name in ALL_ARCHS:
+                    t0 = time.perf_counter()
+                    logits = models_dict[arch_name](sample_tensor)
+                    prob_val = torch.sigmoid(logits).item()
+                    indiv_latencies[arch_name] = (time.perf_counter() - t0) * 1000.0
+                    indiv_probs[arch_name] = prob_val
+                    recall_weights[arch_name] = float(PERFORMANCE_DATA[target_hw][arch_name]['recall'].replace('%', ''))
+            
+            # --- Aggregation Math ---
+            weighted_prob = sum(indiv_probs[a] * recall_weights[a] for a in ALL_ARCHS) / sum(recall_weights.values())
+            mean_prob = sum(indiv_probs.values()) / len(ALL_ARCHS)
+            votes_failing = sum(1 for a in ALL_ARCHS if indiv_probs[a] > 0.5)
+            total_latency = sum(indiv_latencies.values())
+            
+            if agg_strategy == "Recall-Weighted Soft Voting":
+                consensus_prob = weighted_prob
+                is_failing_consensus = consensus_prob > 0.5
+            elif agg_strategy == "Unweighted Mean Probability":
+                consensus_prob = mean_prob
+                is_failing_consensus = consensus_prob > 0.5
+            else:
+                consensus_prob = weighted_prob
+                is_failing_consensus = votes_failing >= 2
                 
+            st.markdown("---")
+            st.markdown("##### Individual Architecture Degradation Probabilities & Consensus")
+            
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric(
+                "Bi-LSTM Probability",
+                f"{indiv_probs['BiLSTM'] * 100:.2f}%",
+                delta="FAILING" if indiv_probs['BiLSTM'] > 0.5 else "HEALTHY",
+                delta_color="inverse" if indiv_probs['BiLSTM'] > 0.5 else "normal"
+            )
+            mc1.caption(f"Latency: {indiv_latencies['BiLSTM']:.2f} ms | Weight: {recall_weights['BiLSTM']:.1f}%")
+            
+            mc2.metric(
+                "Bi-GRU Probability",
+                f"{indiv_probs['GRU'] * 100:.2f}%",
+                delta="FAILING" if indiv_probs['GRU'] > 0.5 else "HEALTHY",
+                delta_color="inverse" if indiv_probs['GRU'] > 0.5 else "normal"
+            )
+            mc2.caption(f"Latency: {indiv_latencies['GRU']:.2f} ms | Weight: {recall_weights['GRU']:.1f}%")
+            
+            mc3.metric(
+                "1D-CNN Probability",
+                f"{indiv_probs['CNN1D'] * 100:.2f}%",
+                delta="FAILING" if indiv_probs['CNN1D'] > 0.5 else "HEALTHY",
+                delta_color="inverse" if indiv_probs['CNN1D'] > 0.5 else "normal"
+            )
+            mc3.caption(f"Latency: {indiv_latencies['CNN1D']:.2f} ms | Weight: {recall_weights['CNN1D']:.1f}%")
+            
+            mc4.metric(
+                "Aggregated Consensus",
+                f"{consensus_prob * 100:.2f}%",
+                delta=f"{votes_failing}/3 Models Flagged",
+                delta_color="inverse" if is_failing_consensus else "normal"
+            )
+            mc4.caption(f"Total Latency: {total_latency:.2f} ms ({agg_strategy})")
+            
             st.markdown("---")
             col1, col2 = st.columns(2)
             
             with col1:
-                if probability > 0.5:
-                    st.error("CRITICAL ALARM: HARDWARE FAILURE PREDICTED")
+                if is_failing_consensus:
+                    st.error("CRITICAL ALARM: HARDWARE FAILURE PREDICTED BY CONSENSUS")
                 else:
-                    st.success("DRIVE HEALTH OPTIMAL")
+                    st.success("DRIVE HEALTH OPTIMAL BY CONSENSUS")
                 
-                st.write(f"**Calculated Degradation Probability:** {probability * 100:.2f}%")
-                st.write(f"**OS Daemon Inference Latency:** {inference_ms:.2f} ms")
+                summary_df = pd.DataFrame({
+                    "Diagnostic Method": [
+                        "Bi-LSTM (Recurrent)",
+                        "Bi-GRU (Recurrent)",
+                        "1D-CNN (Spatial)",
+                        "Unweighted Mean Aggregation",
+                        "Recall-Weighted Aggregation"
+                    ],
+                    "Degradation Probability": [
+                        f"{indiv_probs['BiLSTM']*100:.2f}%",
+                        f"{indiv_probs['GRU']*100:.2f}%",
+                        f"{indiv_probs['CNN1D']*100:.2f}%",
+                        f"{mean_prob*100:.2f}%",
+                        f"{weighted_prob*100:.2f}%"
+                    ],
+                    "Status Verdict": [
+                        "Failing" if indiv_probs['BiLSTM'] > 0.5 else "Healthy",
+                        "Failing" if indiv_probs['GRU'] > 0.5 else "Healthy",
+                        "Failing" if indiv_probs['CNN1D'] > 0.5 else "Healthy",
+                        "Failing" if mean_prob > 0.5 else "Healthy",
+                        "Failing" if weighted_prob > 0.5 else "Healthy"
+                    ]
+                })
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
             
             with col2:
-                st.write("**Explainable AI (XAI) Sensor Analysis**")
+                st.write(f"**Explainable AI (XAI) Sensor Attribution (via {target_arch})**")
                 try:
+                    active_model = models_dict[target_arch]
                     background_data = torch.randn(100, 15, 6)
-                    explainer = shap.GradientExplainer(model, background_data)
+                    explainer = shap.GradientExplainer(active_model, background_data)
                     
                     tensor_for_shap = sample_tensor.clone().detach().requires_grad_(True)
                     shap_values = explainer.shap_values(tensor_for_shap)
@@ -253,7 +354,7 @@ with tab1:
                     feature_importance = [float(val) for val in np.abs(shap_values).sum(axis=0).flatten()]
                     
                     fig, ax = plt.subplots(figsize=(6, 3))
-                    ax.barh(feature_names, feature_importance, color='#ff4b4b' if probability > 0.5 else '#00cc66')
+                    ax.barh(feature_names, feature_importance, color='#ff4b4b' if is_failing_consensus else '#00cc66')
                     ax.set_xlabel("Cumulative SHAP Value")
                     plt.tight_layout()
                     st.pyplot(fig)
