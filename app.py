@@ -368,7 +368,7 @@ with tab2:
     col1.metric("Total Sequences Analyzed", HW_CONFIG[target_hw]['total'])
     col2.metric("Healthy Sequences", HW_CONFIG[target_hw]['healthy'])
     col3.metric("Verified Hardware Failures", HW_CONFIG[target_hw]['failed'])
-    st.info("Note: The extreme class imbalance necessitates dynamic cost-sensitive learning over synthetic oversampling.")
+    st.info("Note: The extreme class imbalance necessitates Asymmetric Minority-Class Weighted Cross-Entropy (BCEWithLogitsLoss) over synthetic oversampling.")
     
     st.markdown("---")
     st.subheader("Vendor-Specific Feature Engineering")
@@ -400,32 +400,33 @@ with tab3:
     fn, tp = metrics['cm'][1]
     total_samples = tn + fp + fn + tp
     
-    # Exact Mathematical Derivations from Confusion Matrix
+    # Exact Mathematical Derivations from Confusion Matrix & Classification Report
     overall_acc = ((tn + tp) / total_samples) * 100.0
     specificity = (tn / (tn + fp)) * 100.0
     sensitivity = (tp / (tp + fn)) * 100.0
     balanced_acc = (sensitivity + specificity) / 2.0
-    failure_precision = float(metrics['cr']['precision'][1])
-    failure_f1 = float(metrics['cr']['f1'][1])
+    
+    # Standard (Normal/Overall) Precision and F1-Score
+    normal_precision = float(metrics['cr']['precision'][4])
+    normal_f1 = float(metrics['cr']['f1'][4])
     macro_f1 = float(metrics['cr']['f1'][3])
-    weighted_f1 = float(metrics['cr']['f1'][4])
     pos_weight = float(HW_CONFIG[target_hw]['healthy'].replace(',','')) / float(HW_CONFIG[target_hw]['failed'].replace(',',''))
     
-    # Row 1: Standard Classification Metrics (What the Professor Expects)
-    st.markdown("##### Standard & Global Classification Metrics")
+    # Row 1: Standard Classification Metrics (Precision & F1-Score First)
+    st.markdown("##### Standard Classification Metrics")
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-    r1c1.metric("Overall Accuracy", f"{overall_acc:.4f}%")
-    r1c2.metric("Balanced Accuracy", f"{balanced_acc:.2f}%")
-    r1c3.metric("Specificity (TNR)", f"{specificity:.4f}%")
-    r1c4.metric("Weighted F1-Score", f"{weighted_f1:.4f}")
+    r1c1.metric("Precision", f"{normal_precision:.4f}")
+    r1c2.metric("F1-Score", f"{normal_f1:.4f}")
+    r1c3.metric("Accuracy", f"{overall_acc:.4f}%")
+    r1c4.metric("Recall (Sensitivity)", metrics['recall'])
     
-    # Row 2: Anomaly & Minority-Class Metrics (Domain-Specific Metrics)
-    st.markdown("##### Minority-Class (Failure) & Cost-Sensitive Metrics")
+    # Row 2: Diagnostic & Asymmetric Minority-Class Weighted Cross-Entropy Metrics
+    st.markdown("##### Diagnostic & Asymmetric Minority-Class Weighted Cross-Entropy Metrics")
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    r2c1.metric("Failure Recall (Sensitivity)", metrics['recall'])
-    r2c2.metric("False Alarm Rate (FAR)", metrics['far'], delta="< 0.1% Target", delta_color="inverse")
-    r2c3.metric("Failure Precision / F1", f"{failure_precision:.4f} / {failure_f1:.4f}")
-    r2c4.metric("Dynamic Penalty (pos_weight)", f"{pos_weight:.2f}")
+    r2c1.metric("Balanced Accuracy", f"{balanced_acc:.2f}%")
+    r2c2.metric("Specificity (TNR)", f"{specificity:.4f}%")
+    r2c3.metric("False Alarm Rate (FAR)", metrics['far'], delta="< 0.1% Target", delta_color="inverse")
+    r2c4.metric("Asymmetric Weight (pos_weight)", f"{pos_weight:.2f}")
     
     st.markdown("---")
     st.subheader("Detailed Diagnostic Report")
@@ -469,14 +470,14 @@ with tab3:
             benchmark_rows.append({
                 "Hardware Vendor": hw_name,
                 "Architecture": arch_name,
+                "Precision": m_data['cr']['precision'][4],
+                "F1-Score": m_data['cr']['f1'][4],
                 "Accuracy (%)": f"{m_acc:.4f}%",
+                "Recall (%)": m_data['recall'],
                 "Balanced Acc (%)": f"{m_bal:.2f}%",
-                "Recall / Sensitivity (%)": m_data['recall'],
                 "Specificity (%)": f"{m_spec:.4f}%",
                 "FAR (%)": m_data['far'],
-                "Precision (Failure)": m_data['cr']['precision'][1],
-                "F1-Score (Failure)": m_data['cr']['f1'][1],
-                "Macro F1": m_data['cr']['f1'][3],
-                "Weighted F1": m_data['cr']['f1'][4]
+                "Macro Precision": m_data['cr']['precision'][3],
+                "Macro F1": m_data['cr']['f1'][3]
             })
     st.dataframe(pd.DataFrame(benchmark_rows), use_container_width=True, hide_index=True)
